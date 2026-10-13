@@ -133,6 +133,7 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 	// Default TTL to prevent reading stale cache for a long time when the connection fails.
 	clientCacheExpiry := query.duration("client-cache-expire", "client_cache_expire", time.Minute)
 	clientCachePreload := query.getInt("client-cache-preload", "client_cache_preload", 0) // may cause conflict
+	clientCacheRefresh := query.pop("client-cache-refresh") != "false"
 	u.RawQuery = values.Encode()
 
 	hosts := u.Host
@@ -285,6 +286,7 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 	}
 	if clientCache {
 		m.cache = newRedisCache(prefix, clientCacheSize, clientCacheExpiry, clientCachePreload)
+		m.cache.refresh = clientCacheRefresh
 		if err = m.cache.init(m.rdb); err != nil {
 			logger.Warnf("Failed to setup client-side caching: %v", err)
 			m.cache = nil
@@ -973,6 +975,7 @@ func (m *redisMeta) doLookup(ctx Context, parent Ino, name string, inode *Ino, a
 	var cacheKey string
 	var entryTerm uint64
 	if m.cache != nil {
+		m.cache.touchName(parent, name)
 		cacheKey = m.cache.entryName(parent, name)
 		entryTerm = m.cache.entryTerm(parent)
 		if entry, ok := m.cache.entryCache.Get(cacheKey); ok && m.cache.live() {

@@ -21,6 +21,8 @@ package meta
 
 import (
 	"context"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -50,6 +52,19 @@ type cachedDirEntry struct {
 	name string
 	ino  Ino
 	typ  uint8
+}
+
+// recentNames are the names in a directory looked up recently, with the time of the last lookup.
+type recentNames struct {
+	sync.Mutex
+	names map[string]time.Time
+}
+
+const maxRecentNames = 256 // per directory
+
+type entryRef struct {
+	parent Ino
+	name   string
 }
 
 // cachedDir is a complete listing of a directory, valid only while term matches the entry term of the directory.
@@ -86,6 +101,19 @@ type redisCache struct {
 	rtts         [30]time.Duration // recent round-trip times, only used by the tracking goroutine
 	rttIdx       int
 
+	// Refresh-ahead: attrs and names used within refreshWindow are fetched again in batches when invalidated,
+	// so that the next use does not have to wait for Redis.
+	refresh       bool
+	refreshWindow time.Duration
+	refreshDelay  time.Duration // wait for more invalidations to batch
+	refreshBatch  int
+	recentInodes  *expirable.LRU[Ino, struct{}]
+	recentDirs    *expirable.LRU[Ino, *recentNames]
+	pendingMu     sync.Mutex
+	pendingInodes map[Ino]struct{}
+	pendingNames  map[entryRef]struct{}
+	refreshCh     chan struct{}
+
 	inodeCache *expirable.LRU[Ino, []byte]
 	entryCache *expirable.LRU[string, *cachedEntry]
 	entryTerms *expirable.LRU[Ino, uint64]
@@ -106,13 +134,23 @@ func newRedisCache(prefix string, cap int, expiry time.Duration, preload int) *r
 		maxStale:     30 * time.Second,
 		minDeadAfter: 10 * time.Second,
 		start:        time.Now(),
-		inodeCache:   expirable.NewLRU[Ino, []byte](cap, nil, expiry),
-		entryCache:   expirable.NewLRU[string, *cachedEntry](cap, nil, expiry),
-		entryTerms:   expirable.NewLRU[Ino, uint64](0, nil, 10*expiry), // no size limit, cleanup only based on expiry
+
+		refresh:       true,
+		refreshWindow: 30 * time.Second,
+		refreshDelay:  10 * time.Millisecond,
+		refreshBatch:  1000,
+		pendingInodes: make(map[Ino]struct{}),
+		pendingNames:  make(map[entryRef]struct{}),
+		refreshCh:     make(chan struct{}, 1),
+		inodeCache:    expirable.NewLRU[Ino, []byte](cap, nil, expiry),
+		entryCache:    expirable.NewLRU[string, *cachedEntry](cap, nil, expiry),
+		entryTerms:    expirable.NewLRU[Ino, uint64](0, nil, 10*expiry), // no size limit, cleanup only based on expiry
 	}
 	c.dirCache = expirable.NewLRU[Ino, *cachedDir](0, func(_ Ino, d *cachedDir) {
 		c.dirEntries.Add(-int64(len(d.entries)))
 	}, expiry)
+	c.recentInodes = expirable.NewLRU[Ino, struct{}](cap, nil, c.refreshWindow)
+	c.recentDirs = expirable.NewLRU[Ino, *recentNames](cap, nil, c.refreshWindow)
 	c.staleBound.Store(int64(c.minStale))
 	c.confirmed.Store(-int64(c.maxStale)) // not live until the first PING is answered
 	return c
@@ -199,6 +237,7 @@ func (c *redisCache) invalidateDir(parent Ino) {
 // of the following fetch can be cached by addAttr, unless an invalidation arrives in between.
 func (c *redisCache) getAttr(inode Ino, mark bool) ([]byte, bool) {
 	if data, ok := c.inodeCache.Get(inode); ok && len(data) > 0 && c.live() {
+		c.touchInode(inode)
 		return data, true
 	}
 	if mark {
@@ -213,6 +252,188 @@ func (c *redisCache) addAttr(inode Ino, data []byte) {
 	_, _ = c.inodeCache.AddIf(inode, data, func(oldVal []byte, exists bool) bool {
 		return exists && len(oldVal) == 0
 	})
+}
+
+func (c *redisCache) touchInode(inode Ino) {
+	if c.refresh {
+		c.recentInodes.Add(inode, struct{}{})
+	}
+}
+
+func (c *redisCache) touchName(parent Ino, name string) {
+	if !c.refresh {
+		return
+	}
+	rn, ok := c.recentDirs.Get(parent)
+	if !ok {
+		rn = &recentNames{names: make(map[string]time.Time)}
+	}
+	c.recentDirs.Add(parent, rn) // extend its lifetime
+	now := time.Now()
+	rn.Lock()
+	defer rn.Unlock()
+	if _, ok := rn.names[name]; !ok && len(rn.names) >= maxRecentNames {
+		for n, t := range rn.names {
+			if now.Sub(t) > c.refreshWindow {
+				delete(rn.names, n)
+			}
+		}
+		if len(rn.names) >= maxRecentNames {
+			return
+		}
+	}
+	rn.names[name] = now
+}
+
+// queueInode and queueNames are called on invalidation, they must not block.
+func (c *redisCache) queueInode(inode Ino) {
+	if _, ok := c.recentInodes.Peek(inode); !ok {
+		return
+	}
+	c.pendingMu.Lock()
+	if len(c.pendingInodes) < c.cap {
+		c.pendingInodes[inode] = struct{}{}
+	}
+	c.pendingMu.Unlock()
+	c.signalRefresh()
+}
+
+func (c *redisCache) queueNames(parent Ino) {
+	rn, ok := c.recentDirs.Peek(parent)
+	if !ok {
+		return
+	}
+	now := time.Now()
+	rn.Lock()
+	c.pendingMu.Lock()
+	for name, t := range rn.names {
+		if now.Sub(t) <= c.refreshWindow && len(c.pendingNames) < c.cap {
+			c.pendingNames[entryRef{parent, name}] = struct{}{}
+		}
+	}
+	c.pendingMu.Unlock()
+	rn.Unlock()
+	c.signalRefresh()
+}
+
+func (c *redisCache) signalRefresh() {
+	select {
+	case c.refreshCh <- struct{}{}:
+	default:
+	}
+}
+
+func (c *redisCache) takePending(n int) (inodes []Ino, names []entryRef) {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	for ino := range c.pendingInodes {
+		if len(inodes) >= n {
+			break
+		}
+		inodes = append(inodes, ino)
+		delete(c.pendingInodes, ino)
+	}
+	for ref := range c.pendingNames {
+		if len(inodes)+len(names) >= n {
+			break
+		}
+		names = append(names, ref)
+		delete(c.pendingNames, ref)
+	}
+	return
+}
+
+// refresher fetches invalidated attrs and names that were used recently, in batches.
+func (c *redisCache) refresher() {
+	defer c.wg.Done()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-c.done
+		cancel()
+	}()
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-c.refreshCh:
+		}
+		select {
+		case <-c.done:
+			return
+		case <-time.After(c.refreshDelay):
+		}
+		for {
+			inodes, names := c.takePending(c.refreshBatch)
+			if len(inodes)+len(names) == 0 {
+				break
+			}
+			if err := c.refreshAttrs(ctx, inodes); err != nil {
+				logger.Debugf("Redis client-side cache: refresh attrs: %v", err)
+			}
+			if err := c.refreshNames(ctx, names); err != nil {
+				logger.Debugf("Redis client-side cache: refresh names: %v", err)
+			}
+		}
+	}
+}
+
+func (c *redisCache) refreshAttrs(ctx context.Context, inodes []Ino) error {
+	var keys []string
+	var fetch []Ino
+	for _, ino := range inodes {
+		// the mark is removed by an invalidation during the fetch, so a stale result is not cached
+		if _, ok := c.getAttr(ino, true); !ok {
+			keys = append(keys, c.prefix+"i"+ino.String())
+			fetch = append(fetch, ino)
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	rs, err := c.cli.MGet(ctx, keys...).Result()
+	if err != nil {
+		return err
+	}
+	for i, r := range rs {
+		if a, ok := r.(string); ok {
+			c.addAttr(fetch[i], []byte(a))
+		}
+	}
+	return nil
+}
+
+func (c *redisCache) refreshNames(ctx context.Context, names []entryRef) error {
+	if len(names) == 0 {
+		return nil
+	}
+	terms := make([]uint64, len(names))
+	cmds := make([]*redis.StringCmd, len(names))
+	pipe := c.cli.Pipeline()
+	for i, ref := range names {
+		// same as doLookup: entries read under an older term are not cached
+		term := c.entryTerm(ref.parent)
+		terms[i] = term
+		c.entryCache.AddIf(c.entryName(ref.parent, ref.name), &cachedEntry{term: term}, func(oldEntry *cachedEntry, exists bool) bool {
+			return !exists || oldEntry.term < term
+		})
+		cmds[i] = pipe.HGet(ctx, c.prefix+"d"+ref.parent.String(), ref.name)
+	}
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return err
+	}
+	for i, ref := range names {
+		buf, err := cmds[i].Bytes()
+		if err != nil || len(buf) != 9 {
+			continue // removed
+		}
+		ce := &cachedEntry{ino: Ino(binary.BigEndian.Uint64(buf[1:])), term: terms[i]}
+		parent, term := ref.parent, terms[i]
+		_, _ = c.entryCache.AddIf(c.entryName(ref.parent, ref.name), ce, func(oldEntry *cachedEntry, exists bool) bool {
+			return exists && oldEntry.isMark() && oldEntry.term == term && c.entryTerm(parent) == term
+		})
+	}
+	return nil
 }
 
 func (c *redisCache) init(cli redis.UniversalClient) error {
@@ -246,6 +467,10 @@ func (c *redisCache) init(cli redis.UniversalClient) error {
 	c.cli.AddHook(c)
 	c.wg.Add(1)
 	go c.track(sub)
+	if c.refresh {
+		c.wg.Add(1)
+		go c.refresher()
+	}
 	return nil
 }
 
@@ -388,12 +613,14 @@ func (c *redisCache) HandlePushNotification(ctx context.Context, handlerCtx push
 			inode, err := strconv.ParseUint(inodeStr, 10, 64)
 			if err == nil {
 				c.inodeCache.Remove(Ino(inode))
+				c.queueInode(Ino(inode))
 			}
 		case keyTypEntry:
 			parentStr := key[len(c.prefix)+1:]
 			parent, err := strconv.ParseUint(parentStr, 10, 64)
 			if err == nil {
 				c.invalidateDir(Ino(parent))
+				c.queueNames(Ino(parent))
 			}
 		}
 	}
@@ -420,6 +647,7 @@ func (c *redisCache) beforeProcess(cmd redis.Cmder, skip bool) bool {
 		num, err := strconv.ParseUint(key[len(c.prefix)+1:], 10, 64)
 		if err == nil {
 			inode := Ino(num)
+			c.touchInode(inode)
 			if data, ok := c.inodeCache.Get(inode); ok {
 				if !skip && len(data) > 0 && c.live() {
 					rsp := cmd.(*redis.StringCmd)

@@ -4,6 +4,7 @@ package meta
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"syscall"
 	"testing"
@@ -64,6 +65,7 @@ func TestRedisCache(t *testing.T) {
 		ino := Ino(280)
 		require.NoError(t, other.Set(ctx, m.inodeKey(ino), m.marshal(&Attr{Typ: TypeFile}), 0).Err())
 		require.NoError(t, other.Do(ctx, "CLIENT", "KILL", "TYPE", "pubsub").Err())
+		var length uint64
 		require.Eventually(t, func() bool {
 			// cache the attr, then change it from another client
 			m.cache.inodeCache.Remove(ino)
@@ -73,12 +75,18 @@ func TestRedisCache(t *testing.T) {
 			if _, ok := m.cache.inodeCache.Get(ino); !ok {
 				return false
 			}
-			if err := other.Set(ctx, m.inodeKey(ino), m.marshal(&Attr{Typ: TypeFile}), 0).Err(); err != nil {
+			length++
+			if err := other.Set(ctx, m.inodeKey(ino), m.marshal(&Attr{Typ: TypeFile, Length: length}), 0).Err(); err != nil {
 				return false
 			}
 			time.Sleep(200 * time.Millisecond)
-			_, ok := m.cache.inodeCache.Get(ino)
-			return !ok
+			// the old value is invalidated, it may have been refreshed already
+			data, ok := m.cache.inodeCache.Get(ino)
+			var a Attr
+			if ok && len(data) > 0 {
+				a.Unmarshal(data)
+			}
+			return !ok || len(data) == 0 || a.Length == length
 		}, 10*time.Second, 100*time.Millisecond)
 	})
 
@@ -560,5 +568,118 @@ func TestRedisCache(t *testing.T) {
 			cache.observeRTT(100 * time.Millisecond)
 		}
 		require.Equal(t, 3*time.Second, cache.stale())
+	})
+
+	attrOf := func(c *redisCache, ino Ino) (Attr, bool) {
+		var a Attr
+		data, ok := c.inodeCache.Get(ino)
+		if ok && len(data) > 0 {
+			a.Unmarshal(data)
+		}
+		return a, ok && len(data) > 0
+	}
+
+	t.Run("recently used attrs are refreshed when invalidated", func(t *testing.T) {
+		ino := Ino(310)
+		require.NoError(t, other.Set(ctx, m.inodeKey(ino), m.marshal(&Attr{Typ: TypeFile, Length: 1}), 0).Err())
+		require.Eventually(t, func() bool {
+			_, err := m.rdb.Get(ctx, m.inodeKey(ino)).Bytes() // getattr: used and cached
+			a, ok := attrOf(m.cache, ino)
+			return err == nil && ok && a.Length == 1
+		}, 3*time.Second, 10*time.Millisecond)
+
+		require.NoError(t, other.Set(ctx, m.inodeKey(ino), m.marshal(&Attr{Typ: TypeFile, Length: 2}), 0).Err())
+		// fetched again without any further use
+		require.Eventually(t, func() bool {
+			a, ok := attrOf(m.cache, ino)
+			return ok && a.Length == 2
+		}, 3*time.Second, 10*time.Millisecond)
+	})
+
+	t.Run("attrs not used recently are not refreshed", func(t *testing.T) {
+		ino := Ino(311)
+		require.NoError(t, other.Set(ctx, m.inodeKey(ino), m.marshal(&Attr{Typ: TypeFile, Length: 1}), 0).Err())
+		time.Sleep(100 * time.Millisecond) // let the invalidation pass
+		m.cache.inodeCache.Add(ino, m.marshal(&Attr{Typ: TypeFile, Length: 1}))
+		require.NoError(t, other.Set(ctx, m.inodeKey(ino), m.marshal(&Attr{Typ: TypeFile, Length: 2}), 0).Err())
+		require.Eventually(t, func() bool {
+			_, ok := m.cache.inodeCache.Get(ino)
+			return !ok
+		}, 3*time.Second, 10*time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
+		_, ok := m.cache.inodeCache.Get(ino)
+		require.False(t, ok)
+	})
+
+	t.Run("recently looked up names are refreshed when their directory changes", func(t *testing.T) {
+		parent := Ino(320)
+		mkdir(parent, map[string]Ino{"f": 321})
+		var found Ino
+		var attr Attr
+		require.Equal(t, syscall.Errno(0), m.doLookup(Background(), parent, "f", &found, &attr))
+		name := m.cache.entryName(parent, "f")
+
+		// another client replaces "f" and adds "g", which was never looked up
+		require.NoError(t, other.Set(ctx, m.inodeKey(322), m.marshal(&Attr{Typ: TypeFile, Length: 322}), 0).Err())
+		require.NoError(t, other.HSet(ctx, m.entryKey(parent), "f", m.packEntry(TypeFile, 322), "g", m.packEntry(TypeFile, 323)).Err())
+		require.Eventually(t, func() bool {
+			e, ok := m.cache.entryCache.Get(name)
+			return ok && !e.isMark() && e.ino == 322 && e.term == m.cache.entryTerm(parent)
+		}, 3*time.Second, 10*time.Millisecond)
+		_, ok := m.cache.entryCache.Get(m.cache.entryName(parent, "g"))
+		require.False(t, ok)
+
+		require.NoError(t, other.HDel(ctx, m.entryKey(parent), "f").Err())
+		require.Eventually(t, func() bool {
+			return m.doLookup(Background(), parent, "f", &found, &attr) == syscall.ENOENT
+		}, 3*time.Second, 10*time.Millisecond)
+	})
+
+	t.Run("refresh batches are bounded", func(t *testing.T) {
+		cache := newLiveCache("jfs", 10, time.Minute)
+		for i := range 20 {
+			ino := Ino(400 + i)
+			cache.touchInode(ino)
+			cache.queueInode(ino)
+		}
+		cache.queueInode(500) // never used
+		inodes, names := cache.takePending(4)
+		require.Len(t, inodes, 4)
+		require.Empty(t, names)
+		inodes, _ = cache.takePending(100)
+		require.Len(t, inodes, 6) // pending is capped at the cache size
+
+		for i := range maxRecentNames + 10 {
+			cache.touchName(600, strconv.Itoa(i))
+		}
+		cache.queueNames(600)
+		_, names = cache.takePending(1000)
+		require.Len(t, names, 10) // capped at the cache size
+		rn, _ := cache.recentDirs.Peek(600)
+		require.Len(t, rn.names, maxRecentNames)
+	})
+
+	t.Run("refresh can be disabled", func(t *testing.T) {
+		m2, err := newRedisMeta("redis", "127.0.0.1:6379/10?client-cache=true&client-cache-refresh=false", testConfig())
+		require.NoError(t, err)
+		defer m2.Shutdown()
+		rm := m2.(*redisMeta)
+		require.False(t, rm.cache.refresh)
+		require.Eventually(t, rm.cache.live, 3*time.Second, 10*time.Millisecond)
+
+		ino := Ino(330)
+		require.NoError(t, other.Set(ctx, rm.inodeKey(ino), rm.marshal(&Attr{Typ: TypeFile, Length: 1}), 0).Err())
+		time.Sleep(100 * time.Millisecond)
+		require.NoError(t, rm.rdb.Get(ctx, rm.inodeKey(ino)).Err())
+		_, ok := attrOf(rm.cache, ino)
+		require.True(t, ok)
+		require.NoError(t, other.Set(ctx, rm.inodeKey(ino), rm.marshal(&Attr{Typ: TypeFile, Length: 2}), 0).Err())
+		require.Eventually(t, func() bool {
+			_, ok := rm.cache.inodeCache.Get(ino)
+			return !ok
+		}, 3*time.Second, 10*time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
+		_, ok = rm.cache.inodeCache.Get(ino)
+		require.False(t, ok)
 	})
 }

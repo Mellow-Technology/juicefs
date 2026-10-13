@@ -29,6 +29,7 @@ JuiceFS supports Redis CSC through the following options in the metadata URL:
 - `client-cache-size`: Maximum cache size (default: 12800)
 - `client-cache-expire`: Cache expiration time (default: 60s)
 - `client-cache-preload`: Number of file objects under the root directory preloaded after mounting. (default: 0)
+- `client-cache-refresh`: Refresh recently used attributes and names when they are changed by other clients (default: true, set to `false` to disable)
 
 When client-side caching is enabled, JuiceFS caches:
 
@@ -71,6 +72,10 @@ Cached data is kept up to date by invalidation messages, not by expiration:
 - The client sends a `PING` on the tracking connection every second. Since its reply arrives only after all earlier invalidation messages, cached data is used only while a recently sent `PING` has been answered; otherwise requests go to Redis. "Recently" adapts to the latency measured by these `PING`s: 1 second plus twice the largest recent round-trip time, at least 3 and at most 30 seconds. A tracking connection that receives nothing for 3 times that long (at least 10 seconds) is reconnected, and the cache is cleared on every reconnect.
 
 So cached data is never more than a few seconds behind (up to 30 seconds on very slow links), even if the connection to Redis is lost, and `client-cache-expire` only bounds memory usage of rarely used entries. It can be set much longer (e.g. `10m`) when Redis is far away.
+
+### Refresh-ahead
+
+An invalidation message only names the changed key, so the next use of it has to wait for Redis. To avoid that, attributes read and names looked up within the last 30 seconds are fetched again in the background when they are invalidated, batched into a single `MGET` (attributes) and a single pipeline of `HGET` (names) every 10 milliseconds. Directory listings are not refreshed ahead, since a change of one entry requires reading the whole directory again. Disable it with `client-cache-refresh=false` if the extra reads matter more than the latency, e.g. for many clients sharing frequently changed files.
 
 ## Requirements
 
