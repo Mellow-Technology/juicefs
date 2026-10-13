@@ -12,6 +12,7 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"github.com/redis/go-redis/v9/push"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -681,5 +682,152 @@ func TestRedisCache(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 		_, ok = rm.cache.inodeCache.Get(ino)
 		require.False(t, ok)
+	})
+
+	t.Run("listings are patched with the changelog", func(t *testing.T) {
+		const db = 12
+		writer, err := newRedisMeta("redis", "127.0.0.1:6379/"+strconv.Itoa(db), testConfig())
+		require.NoError(t, err)
+		defer writer.Shutdown()
+		require.NoError(t, writer.Reset())
+		format := testFormat()
+		format.ChangeLog = true
+		require.NoError(t, writer.Init(format, true))
+		m2, err := newRedisMeta("redis", "127.0.0.1:6379/"+strconv.Itoa(db)+"?client-cache=true", testConfig())
+		require.NoError(t, err)
+		defer m2.Shutdown()
+		_, err = m2.Load(true)
+		require.NoError(t, err)
+		reader := m2.(*redisMeta)
+		require.True(t, reader.cache.patchable())
+		require.Eventually(t, reader.cache.live, 3*time.Second, 10*time.Millisecond)
+		raw := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379", DB: db})
+		defer raw.Close()
+
+		wctx := Background()
+		mkdir := func(parent Ino, name string) Ino {
+			var ino Ino
+			require.Equal(t, syscall.Errno(0), writer.Mkdir(wctx, parent, name, 0755, 0, 0, &ino, nil))
+			return ino
+		}
+		create := func(parent Ino, name string) Ino {
+			var ino Ino
+			require.Equal(t, syscall.Errno(0), writer.Mknod(wctx, parent, name, TypeFile, 0644, 0, 0, "", &ino, nil))
+			return ino
+		}
+		list := func(dir Ino) {
+			var es []*Entry
+			require.Equal(t, syscall.Errno(0), reader.doReaddir(Background(), dir, 0, &es, -1))
+			d, ok := reader.cache.dirCache.Peek(dir)
+			require.True(t, ok)
+			require.GreaterOrEqual(t, d.version, int64(0))
+		}
+		// cached returns the cached listing of dir; without any readdir in between, a listing
+		// that is cached after a change was patched.
+		cached := func(dir Ino) map[string]cachedDirEntry {
+			es, ok := reader.cache.getDir(dir)
+			if !ok {
+				return nil
+			}
+			m := make(map[string]cachedDirEntry, len(es))
+			for _, e := range es {
+				m[e.name] = e
+			}
+			return m
+		}
+		keys := func(m map[string]cachedDirEntry) []string {
+			var ks []string
+			for k := range m {
+				ks = append(ks, k)
+			}
+			return ks
+		}
+		stays := func(cond func() bool) {
+			require.Eventually(t, cond, 3*time.Second, 10*time.Millisecond)
+			time.Sleep(300 * time.Millisecond)
+			require.True(t, cond())
+		}
+
+		t.Run("changes of single names", func(t *testing.T) {
+			dir := mkdir(RootInode, "d1")
+			a, _ := create(dir, "a"), create(dir, "b")
+			list(dir)
+			c := create(dir, "we|ird,(name)%")
+			require.Equal(t, syscall.Errno(0), writer.Unlink(wctx, dir, "a"))
+			require.Equal(t, syscall.Errno(0), writer.Rename(wctx, dir, "b", dir, "b2", 0, nil, nil))
+			e := mkdir(dir, "e")
+			mkdir(dir, "f")
+			require.Equal(t, syscall.Errno(0), writer.Rmdir(wctx, dir, "f"))
+			require.Eventually(t, func() bool {
+				return assert.ElementsMatch(new(testing.T), []string{"b2", "we|ird,(name)%", "e"}, keys(cached(dir)))
+			}, 3*time.Second, 10*time.Millisecond)
+			got := cached(dir)
+			require.Equal(t, c, got["we|ird,(name)%"].ino)
+			require.Equal(t, e, got["e"].ino)
+			require.Equal(t, uint8(TypeDirectory), got["e"].typ)
+			require.Equal(t, uint8(TypeFile), got["b2"].typ) // type taken from the listing before the rename
+			require.NotEqual(t, a, got["b2"].ino)
+		})
+
+		t.Run("rename across cached directories", func(t *testing.T) {
+			src, dst := mkdir(RootInode, "src"), mkdir(RootInode, "dst")
+			x := create(src, "x")
+			list(src)
+			list(dst)
+			require.Equal(t, syscall.Errno(0), writer.Rename(wctx, src, "x", dst, "y", 0, nil, nil))
+			require.Eventually(t, func() bool {
+				s, d := cached(src), cached(dst)
+				return s != nil && d != nil && len(s) == 0 && len(d) == 1 && d["y"].ino == x
+			}, 3*time.Second, 10*time.Millisecond)
+		})
+
+		t.Run("unknown types and unlogged changes drop listings", func(t *testing.T) {
+			src, dst := mkdir(RootInode, "uncached"), mkdir(RootInode, "dst2")
+			create(src, "x")
+			list(dst)
+			// the type of the moved entry is not in the changelog
+			require.Equal(t, syscall.Errno(0), writer.Rename(wctx, src, "x", dst, "x", 0, nil, nil))
+			stays(func() bool { return cached(dst) == nil })
+
+			list(dst)
+			require.Equal(t, syscall.Errno(0), writer.Link(wctx, create(src, "l"), dst, "l", nil))
+			stays(func() bool { return cached(dst) == nil })
+
+			// a change that is not in the changelog, e.g. by a client without it
+			list(dst)
+			require.NoError(t, raw.HSet(ctx, reader.entryKey(dst), "raw", reader.packEntry(TypeFile, 9999)).Err())
+			stays(func() bool { return cached(dst) == nil })
+		})
+
+		t.Run("trimmed changelog drops listings", func(t *testing.T) {
+			dir := mkdir(RootInode, "trim")
+			create(dir, "a")
+			create(dir, "b")
+			last, err := raw.Get(ctx, reader.txnLastLog()).Int64()
+			require.NoError(t, err)
+			require.NoError(t, raw.LTrim(ctx, reader.txnLogKey(), -1, -1).Err())
+			d := &cachedDir{term: reader.cache.entryTerm(dir), version: last - 2, entries: []cachedDirEntry{{name: "a", ino: 1, typ: TypeFile}}}
+			require.NoError(t, reader.cache.patchDirs(ctx, map[Ino]*cachedDir{dir: d}))
+			require.Nil(t, cached(dir))
+		})
+	})
+
+	t.Run("changelog entries are parsed", func(t *testing.T) {
+		for _, name := range []string{"plain", "we|ird", "a,b", "(p)", "100%", "x\ty", "new\nline", "\x00", "名字", "a\"b"} {
+			got, err := logDecode(logEncode2(name))
+			require.NoError(t, err)
+			require.Equal(t, name, got)
+		}
+		op, args, result, err := parseLogEntry("1.000000001|CREATE(1," + logEncode2("a|b,c") + ",0,0,1,420,18,,linux,true,0,33188):5|(3,4)")
+		require.NoError(t, err)
+		require.Equal(t, "CREATE", op)
+		require.Equal(t, "5", result)
+		name, err := logDecode(args[1])
+		require.NoError(t, err)
+		require.Equal(t, "a|b,c", name)
+		_, _, _, err = parseLogEntry("garbage")
+		require.Error(t, err)
+		_, err = logDecode("bad%G1")
+		require.Error(t, err)
 	})
 }

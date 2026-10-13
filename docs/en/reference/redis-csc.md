@@ -75,7 +75,7 @@ So cached data is never more than a few seconds behind (up to 30 seconds on very
 
 ### Refresh-ahead
 
-An invalidation message only names the changed key, so the next use of it has to wait for Redis. To avoid that, attributes read and names looked up within the last 30 seconds are fetched again in the background when they are invalidated, batched into a single `MGET` (attributes) and a single pipeline of `HGET` (names) every 10 milliseconds. Directory listings are not refreshed ahead, since a change of one entry requires reading the whole directory again. Disable it with `client-cache-refresh=false` if the extra reads matter more than the latency, e.g. for many clients sharing frequently changed files.
+An invalidation message only names the changed key, so the next use of it has to wait for Redis. To avoid that, attributes read and names looked up within the last 30 seconds are fetched again in the background when they are invalidated, batched into a single `MGET` (attributes) and a single pipeline of `HGET` (names) every 10 milliseconds. Directory listings are not refreshed ahead, since a change of one entry requires reading the whole directory again, unless the changelog is enabled on the volume (`juicefs config META-URL --changelog`): then a changed listing is patched with the changelog since it was read, in one round trip for all changed directories. Only creating, removing and renaming single entries is patched; other changes, or a patched listing whose size differs from the directory in Redis, drop the listing so that it is read again on next use. Disable it with `client-cache-refresh=false` if the extra reads matter more than the latency, e.g. for many clients sharing frequently changed files.
 
 ## Requirements
 

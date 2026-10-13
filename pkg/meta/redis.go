@@ -287,6 +287,10 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 	if clientCache {
 		m.cache = newRedisCache(prefix, clientCacheSize, clientCacheExpiry, clientCachePreload)
 		m.cache.refresh = clientCacheRefresh
+		m.cache.changelog = func() bool {
+			f := m.getFormat()
+			return f != nil && f.ChangeLog
+		}
 		if err = m.cache.init(m.rdb); err != nil {
 			logger.Warnf("Failed to setup client-side caching: %v", err)
 			m.cache = nil
@@ -2886,6 +2890,7 @@ func (m *redisMeta) fillAttr(ctx Context, es []*Entry, cacheable bool) error {
 // Complete listings are served from and added to the client-side cache if enabled.
 func (m *redisMeta) readEntries(ctx Context, inode Ino, limit int) ([]*Entry, error) {
 	var term uint64
+	version := int64(-1)
 	if m.cache != nil {
 		if cached, ok := m.cache.getDir(inode); ok {
 			if limit > 0 && limit < len(cached) {
@@ -2905,6 +2910,12 @@ func (m *redisMeta) readEntries(ctx Context, inode Ino, limit int) ([]*Entry, er
 			return entries, nil
 		}
 		term = m.cache.entryTerm(inode)
+		if m.cache.patchable() {
+			// read before the listing, so that replaying the changelog after it covers all changes
+			if v, err := m.rdb.Get(ctx, m.txnLastLog()).Int64(); err == nil || errors.Is(err, redis.Nil) {
+				version = v
+			}
+		}
 	}
 
 	var entries []*Entry
@@ -2937,7 +2948,7 @@ func (m *redisMeta) readEntries(ctx Context, inode Ino, limit int) ([]*Entry, er
 		return nil, err
 	}
 	if m.cache != nil {
-		m.cache.addDir(inode, term, entries)
+		m.cache.addDirAt(inode, term, version, entries)
 	}
 	return entries, nil
 }

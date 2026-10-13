@@ -70,6 +70,7 @@ type entryRef struct {
 // cachedDir is a complete listing of a directory, valid only while term matches the entry term of the directory.
 type cachedDir struct {
 	term    uint64
+	version int64 // version of the changelog the listing reflects, -1 if unknown
 	entries []cachedDirEntry
 }
 
@@ -113,6 +114,8 @@ type redisCache struct {
 	pendingInodes map[Ino]struct{}
 	pendingNames  map[entryRef]struct{}
 	refreshCh     chan struct{}
+	changelog     func() bool        // whether the volume has the changelog enabled
+	patching      map[Ino]*cachedDir // invalidated listings to patch with the changelog, guarded by pendingMu
 
 	inodeCache *expirable.LRU[Ino, []byte]
 	entryCache *expirable.LRU[string, *cachedEntry]
@@ -141,6 +144,7 @@ func newRedisCache(prefix string, cap int, expiry time.Duration, preload int) *r
 		refreshBatch:  1000,
 		pendingInodes: make(map[Ino]struct{}),
 		pendingNames:  make(map[entryRef]struct{}),
+		patching:      make(map[Ino]*cachedDir),
 		refreshCh:     make(chan struct{}, 1),
 		inodeCache:    expirable.NewLRU[Ino, []byte](cap, nil, expiry),
 		entryCache:    expirable.NewLRU[string, *cachedEntry](cap, nil, expiry),
@@ -211,12 +215,24 @@ func (c *redisCache) getDir(parent Ino) ([]cachedDirEntry, bool) {
 
 // addDir caches a complete listing of parent read under term. It is dropped if parent changed meanwhile.
 func (c *redisCache) addDir(parent Ino, term uint64, entries []*Entry) {
+	c.addDirAt(parent, term, -1, entries)
+}
+
+// addDirAt is addDir for a listing read after the given version of the changelog, so that it can be patched.
+func (c *redisCache) addDirAt(parent Ino, term uint64, version int64, entries []*Entry) {
 	if !c.fits(len(entries)) || c.entryTerm(parent) != term {
 		return
 	}
-	d := &cachedDir{term: term, entries: make([]cachedDirEntry, len(entries))}
+	d := &cachedDir{term: term, version: version, entries: make([]cachedDirEntry, len(entries))}
 	for i, e := range entries {
 		d.entries[i] = cachedDirEntry{name: string(e.Name), ino: e.Inode, typ: e.Attr.Typ}
+	}
+	c.storeDir(parent, d)
+}
+
+func (c *redisCache) storeDir(parent Ino, d *cachedDir) {
+	if !c.fits(len(d.entries)) {
+		return
 	}
 	c.dirCache.Remove(parent) // Add does not call onEvict when replacing
 	c.dirCache.Add(parent, d)
@@ -230,6 +246,9 @@ func (c *redisCache) addDir(parent Ino, term uint64, entries []*Entry) {
 
 func (c *redisCache) invalidateDir(parent Ino) {
 	c.bumpEntryTerm(parent)
+	if d, ok := c.dirCache.Peek(parent); ok && d.version >= 0 && c.patchable() {
+		c.queuePatch(parent, d)
+	}
 	c.dirCache.Remove(parent)
 }
 
@@ -365,7 +384,8 @@ func (c *redisCache) refresher() {
 		}
 		for {
 			inodes, names := c.takePending(c.refreshBatch)
-			if len(inodes)+len(names) == 0 {
+			dirs := c.takePatching(c.refreshBatch)
+			if len(inodes)+len(names)+len(dirs) == 0 {
 				break
 			}
 			if err := c.refreshAttrs(ctx, inodes); err != nil {
@@ -373,6 +393,11 @@ func (c *redisCache) refresher() {
 			}
 			if err := c.refreshNames(ctx, names); err != nil {
 				logger.Debugf("Redis client-side cache: refresh names: %v", err)
+			}
+			if len(dirs) > 0 {
+				if err := c.patchDirs(ctx, dirs); err != nil {
+					logger.Debugf("Redis client-side cache: patch listings: %v", err)
+				}
 			}
 		}
 	}
