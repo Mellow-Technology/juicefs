@@ -2839,7 +2839,21 @@ func (m *redisMeta) doLink(ctx Context, inode, parent Ino, name string, attr *At
 	}, m.inodeKey(parent), m.entryKey(parent), m.inodeKey(inode)))
 }
 
-func (m *redisMeta) fillAttr(ctx Context, es []*Entry) error {
+// fillAttr fills the attributes of es, using the client-side cache if enabled.
+// Fetched attributes are added to the cache only if cacheable.
+func (m *redisMeta) fillAttr(ctx Context, es []*Entry, cacheable bool) error {
+	if m.cache != nil {
+		misses := es[:0:0]
+		for _, e := range es {
+			if data, ok := m.cache.getAttr(e.Inode, cacheable); ok {
+				m.parseAttr(data, e.Attr)
+				m.of.Update(e.Inode, e.Attr)
+			} else {
+				misses = append(misses, e)
+			}
+		}
+		es = misses
+	}
 	if len(es) == 0 {
 		return nil
 	}
@@ -2856,13 +2870,41 @@ func (m *redisMeta) fillAttr(ctx Context, es []*Entry) error {
 			if a, ok := re.(string); ok {
 				m.parseAttr([]byte(a), es[j].Attr)
 				m.of.Update(es[j].Inode, es[j].Attr)
+				if m.cache != nil && cacheable {
+					m.cache.addAttr(es[j].Inode, []byte(a))
+				}
 			}
 		}
 	}
 	return nil
 }
 
-func (m *redisMeta) doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*Entry, limit int) syscall.Errno {
+// readEntries lists up to limit (all if limit <= 0) entries of a directory, with only the type in attributes.
+// Complete listings are served from and added to the client-side cache if enabled.
+func (m *redisMeta) readEntries(ctx Context, inode Ino, limit int) ([]*Entry, error) {
+	var term uint64
+	if m.cache != nil {
+		if cached, ok := m.cache.getDir(inode); ok {
+			if limit > 0 && limit < len(cached) {
+				cached = cached[:limit]
+			}
+			entries := make([]*Entry, len(cached))
+			newEntries := make([]Entry, len(cached))
+			newAttrs := make([]Attr, len(cached))
+			for i, ce := range cached {
+				ent := &newEntries[i]
+				ent.Inode = ce.ino
+				ent.Name = []byte(ce.name)
+				ent.Attr = &newAttrs[i]
+				ent.Attr.Typ = ce.typ
+				entries[i] = ent
+			}
+			return entries, nil
+		}
+		term = m.cache.entryTerm(inode)
+	}
+
+	var entries []*Entry
 	var stop = errors.New("stop")
 	err := m.hscan(ctx, m.entryKey(inode), func(keys []string) error {
 		newEntries := make([]Entry, len(keys)/2)
@@ -2878,25 +2920,41 @@ func (m *redisMeta) doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*En
 			ent.Name = []byte(keys[i])
 			ent.Attr = &newAttrs[i/2]
 			ent.Attr.Typ = typ
-			*entries = append(*entries, ent)
-			if limit > 0 && len(*entries) >= limit {
+			entries = append(entries, ent)
+			if limit > 0 && len(entries) >= limit {
 				return stop
 			}
 		}
 		return nil
 	})
 	if errors.Is(err, stop) {
-		err = nil
+		return entries, nil
 	}
+	if err != nil {
+		return nil, err
+	}
+	if m.cache != nil {
+		m.cache.addDir(inode, term, entries)
+	}
+	return entries, nil
+}
+
+func (m *redisMeta) doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*Entry, limit int) syscall.Errno {
+	if limit > 0 {
+		limit = max(limit-len(*entries), 1)
+	}
+	listed, err := m.readEntries(ctx, inode, limit)
 	if err != nil {
 		return errno(err)
 	}
+	*entries = append(*entries, listed...)
 
 	if plus != 0 && len(*entries) != 0 {
 		batchSize := 4096
 		nEntries := len(*entries)
+		cacheable := m.cache.fits(nEntries)
 		if nEntries <= batchSize {
-			err = m.fillAttr(ctx, *entries)
+			err = m.fillAttr(ctx, *entries, cacheable)
 		} else {
 			indexCh := make(chan []*Entry, 10)
 			var wg sync.WaitGroup
@@ -2905,7 +2963,7 @@ func (m *redisMeta) doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*En
 				go func() {
 					defer wg.Done()
 					for es := range indexCh {
-						e := m.fillAttr(ctx, es)
+						e := m.fillAttr(ctx, es, cacheable)
 						if e != nil {
 							err = e
 							break
@@ -6262,25 +6320,7 @@ func (s *redisDirHandler) List(ctx Context, offset int) ([]*Entry, syscall.Errno
 	s.Lock()
 	defer s.Unlock()
 	if s.entries == nil {
-		var entries []*Entry
-		err := s.en.hscan(ctx, s.en.entryKey(s.inode), func(keys []string) error {
-			newEntries := make([]Entry, len(keys)/2)
-			newAttrs := make([]Attr, len(keys)/2)
-			for i := 0; i < len(keys); i += 2 {
-				typ, ino := s.en.parseEntry([]byte(keys[i+1]))
-				if keys[i] == "" {
-					logger.Errorf("Corrupt entry with empty name: inode %d parent %d", ino, s.inode)
-					continue
-				}
-				ent := &newEntries[i/2]
-				ent.Inode = ino
-				ent.Name = []byte(keys[i])
-				ent.Attr = &newAttrs[i/2]
-				ent.Attr.Typ = typ
-				entries = append(entries, ent)
-			}
-			return nil
-		})
+		entries, err := s.en.readEntries(ctx, s.inode, 0)
 		if err != nil {
 			return nil, errno(err)
 		}
@@ -6292,8 +6332,9 @@ func (s *redisDirHandler) List(ctx Context, offset int) ([]*Entry, syscall.Errno
 		}
 		if s.plus {
 			nEntries := len(entries)
+			cacheable := s.en.cache.fits(nEntries)
 			if nEntries <= s.batchNum {
-				err = s.en.fillAttr(ctx, entries)
+				err = s.en.fillAttr(ctx, entries, cacheable)
 			} else {
 				eg := errgroup.Group{}
 				eg.SetLimit(2)
@@ -6306,7 +6347,7 @@ func (s *redisDirHandler) List(ctx Context, offset int) ([]*Entry, syscall.Errno
 						es = entries[i : i+s.batchNum]
 					}
 					eg.Go(func() error {
-						return s.en.fillAttr(ctx, es)
+						return s.en.fillAttr(ctx, es, cacheable)
 					})
 				}
 				err = eg.Wait()

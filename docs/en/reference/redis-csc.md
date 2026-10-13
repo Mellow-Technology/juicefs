@@ -34,6 +34,7 @@ When client-side caching is enabled, JuiceFS caches:
 
 1. **Inode attributes**: File/directory metadata like permissions, size, timestamps
 2. **Directory entries**: Name to inode mappings for faster lookups
+3. **Directory listings**: Complete listings of directories, so that repeated `ls` / `readdir` calls don't go to Redis. Together with cached attributes, `ls -l` on a cached directory needs no round trip at all. Directories with more entries than `client-cache-size` are not cached
 
 > **Note:** Redis Client Side Cache requires Redis server version 6.0 or higher. Using this feature with older Redis versions will result in errors.
 
@@ -68,7 +69,7 @@ BCAST mode provides the simplest implementation while ensuring cache coherence a
 
 ## Performance Considerations
 
-1. The default 12800 cache size should be sufficient for most workloads (12800 entries each for attr and entry caches)
+1. The default 12800 cache size should be sufficient for most workloads (12800 entries each for attr and entry caches, and 12800 entries in total for directory listings)
 2. For very large filesystems with millions of files, you may benefit from increasing the cache size
 3. The cache is most effective for metadata-heavy workloads with many repeated operations
 4. For very write-heavy workloads, consider disabling CSC as invalidation traffic may offset benefits

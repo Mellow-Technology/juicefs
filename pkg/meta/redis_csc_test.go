@@ -316,4 +316,184 @@ func TestRedisCache(t *testing.T) {
 		require.True(t, entry.isMark())
 		require.Equal(t, newTerm, entry.term)
 	})
+
+	// other writes as a different client, so they reach m only through invalidation messages
+	other := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379", DB: 10})
+	defer other.Close()
+	names := func(es []*Entry) []string {
+		var ns []string
+		for _, e := range es {
+			ns = append(ns, string(e.Name))
+		}
+		return ns
+	}
+	mkdir := func(parent Ino, children map[string]Ino) {
+		for name, ino := range children {
+			require.NoError(t, other.HSet(ctx, m.entryKey(parent), name, m.packEntry(TypeFile, ino)).Err())
+			require.NoError(t, other.Set(ctx, m.inodeKey(ino), m.marshal(&Attr{Typ: TypeFile, Mode: 0644, Length: uint64(ino)}), 0).Err())
+		}
+		require.Eventually(t, func() bool { return m.cache.entryTerm(parent) > 0 }, 3*time.Second, 10*time.Millisecond)
+	}
+
+	t.Run("dir listing is cached and invalidated by other clients", func(t *testing.T) {
+		parent := Ino(200)
+		mkdir(parent, map[string]Ino{"a": 201, "b": 202})
+
+		var entries []*Entry
+		require.Equal(t, syscall.Errno(0), m.doReaddir(Background(), parent, 0, &entries, -1))
+		require.ElementsMatch(t, []string{"a", "b"}, names(entries))
+		_, ok := m.cache.getDir(parent)
+		require.True(t, ok)
+
+		// served from cache, and callers cannot modify the cached listing
+		entries[0].Name[0] = 'x'
+		entries = nil
+		require.Equal(t, syscall.Errno(0), m.doReaddir(Background(), parent, 0, &entries, -1))
+		require.ElementsMatch(t, []string{"a", "b"}, names(entries))
+
+		require.NoError(t, other.HSet(ctx, m.entryKey(parent), "c", m.packEntry(TypeFile, 203)).Err())
+		require.Eventually(t, func() bool {
+			_, ok := m.cache.getDir(parent)
+			return !ok
+		}, 3*time.Second, 10*time.Millisecond)
+		entries = nil
+		require.Equal(t, syscall.Errno(0), m.doReaddir(Background(), parent, 0, &entries, -1))
+		require.ElementsMatch(t, []string{"a", "b", "c"}, names(entries))
+	})
+
+	t.Run("dir listing is invalidated synchronously by own transactions", func(t *testing.T) {
+		parent := Ino(210)
+		mkdir(parent, map[string]Ino{"a": 211})
+		h := m.newDirHandler(parent, false, nil)
+		entries, st := h.List(Background(), 0)
+		require.Equal(t, syscall.Errno(0), st)
+		require.ElementsMatch(t, []string{"a"}, names(entries))
+		_, ok := m.cache.getDir(parent)
+		require.True(t, ok)
+
+		err := m.rdb.Watch(ctx, func(tx *redis.Tx) error {
+			_, err := tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.HDel(ctx, m.entryKey(parent), "a")
+				pipe.HSet(ctx, m.entryKey(parent), "b", m.packEntry(TypeFile, 212))
+				return nil
+			})
+			return err
+		}, m.entryKey(parent))
+		require.NoError(t, err)
+		// no waiting for the invalidation message
+		_, ok = m.cache.getDir(parent)
+		require.False(t, ok)
+		entries, st = m.newDirHandler(parent, false, nil).List(Background(), 0)
+		require.Equal(t, syscall.Errno(0), st)
+		require.ElementsMatch(t, []string{"b"}, names(entries))
+	})
+
+	t.Run("pipeline hook invalidates writes without waiting for redis", func(t *testing.T) {
+		cache := newRedisCache("", 100, time.Second, 0)
+		hook := cache.ProcessPipelineHook(func(ctx context.Context, cmds []redis.Cmder) error { return nil })
+		ls := []*Entry{{Inode: 271, Name: []byte("a"), Attr: &Attr{Typ: TypeFile}}}
+		cache.addDir(270, 0, ls)
+		cache.addDir(272, 0, ls)
+		cache.inodeCache.Add(271, []byte("attr"))
+
+		require.NoError(t, hook(ctx, []redis.Cmder{
+			redis.NewIntCmd(ctx, "hset", m.entryKey(270), "b", "x"),
+			redis.NewStatusCmd(ctx, "set", m.inodeKey(271), "attr2"),
+		}))
+		_, ok := cache.getDir(270)
+		require.False(t, ok)
+		_, ok = cache.getAttr(271, false)
+		require.False(t, ok)
+		_, ok = cache.getDir(272)
+		require.True(t, ok)
+
+		require.NoError(t, hook(ctx, []redis.Cmder{redis.NewIntCmd(ctx, "del", m.inodeKey(273), m.entryKey(272))}))
+		_, ok = cache.getDir(272)
+		require.False(t, ok)
+	})
+
+	t.Run("readdir plus caches attrs", func(t *testing.T) {
+		parent := Ino(220)
+		mkdir(parent, map[string]Ino{"a": 221, "b": 222})
+		var entries []*Entry
+		require.Equal(t, syscall.Errno(0), m.doReaddir(Background(), parent, 1, &entries, -1))
+		for _, e := range entries {
+			require.Equal(t, uint64(e.Inode), e.Attr.Length)
+			_, ok := m.cache.getAttr(e.Inode, false)
+			require.True(t, ok)
+		}
+
+		require.NoError(t, other.Set(ctx, m.inodeKey(221), m.marshal(&Attr{Typ: TypeFile, Mode: 0644, Length: 1}), 0).Err())
+		require.Eventually(t, func() bool {
+			entries = nil
+			require.Equal(t, syscall.Errno(0), m.doReaddir(Background(), parent, 1, &entries, -1))
+			for _, e := range entries {
+				if e.Inode == 221 {
+					return e.Attr.Length == 1
+				}
+			}
+			return false
+		}, 3*time.Second, 10*time.Millisecond)
+	})
+
+	t.Run("partial listing is not cached", func(t *testing.T) {
+		parent := Ino(230)
+		mkdir(parent, map[string]Ino{"a": 231, "b": 232})
+		var entries []*Entry
+		require.Equal(t, syscall.Errno(0), m.doReaddir(Background(), parent, 0, &entries, 1))
+		require.Len(t, entries, 1)
+		_, ok := m.cache.getDir(parent)
+		require.False(t, ok)
+	})
+
+	t.Run("dir listing read before a change is not cached", func(t *testing.T) {
+		cache := newRedisCache("jfs", 100, time.Second, 0)
+		parent := Ino(240)
+		term := cache.entryTerm(parent)
+		cache.invalidateDir(parent)
+		cache.addDir(parent, term, []*Entry{{Inode: 241, Name: []byte("a"), Attr: &Attr{Typ: TypeFile}}})
+		_, ok := cache.getDir(parent)
+		require.False(t, ok)
+	})
+
+	t.Run("dir cache is bounded by total entries", func(t *testing.T) {
+		cache := newRedisCache("jfs", 10, time.Second, 0)
+		list := func(n int) []*Entry {
+			es := make([]*Entry, n)
+			for i := range es {
+				es[i] = &Entry{Inode: Ino(300 + i), Name: []byte{byte('a' + i)}, Attr: &Attr{Typ: TypeFile}}
+			}
+			return es
+		}
+		cache.addDir(250, 0, list(6))
+		cache.addDir(251, 0, list(6))
+		_, ok := cache.getDir(250)
+		require.False(t, ok)
+		_, ok = cache.getDir(251)
+		require.True(t, ok)
+		require.Equal(t, int64(6), cache.dirEntries.Load())
+
+		cache.addDir(251, 0, list(4)) // replace
+		require.Equal(t, int64(4), cache.dirEntries.Load())
+		cache.addDir(252, 0, list(11))
+		_, ok = cache.getDir(252)
+		require.False(t, ok)
+		cache.invalidateDir(251)
+		require.Equal(t, int64(0), cache.dirEntries.Load())
+	})
+
+	t.Run("dir cache is purged on reconnect", func(t *testing.T) {
+		// a listing cached before any invalidation has term 0, which entry terms restart from after a reconnect
+		parent := Ino(260)
+		require.Equal(t, uint64(0), m.cache.entryTerm(parent))
+		m.cache.addDir(parent, 0, []*Entry{{Inode: 261, Name: []byte("a"), Attr: &Attr{Typ: TypeFile}}})
+		_, ok := m.cache.getDir(parent)
+		require.True(t, ok)
+
+		conn := m.cache.cli.Conn()
+		defer conn.Close()
+		require.NoError(t, m.cache.onInvalidateConnect(ctx, conn))
+		_, ok = m.cache.getDir(parent)
+		require.False(t, ok)
+	})
 }

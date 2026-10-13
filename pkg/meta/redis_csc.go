@@ -45,8 +45,20 @@ func (e *cachedEntry) isMark() bool {
 	return e.ino == 0
 }
 
+type cachedDirEntry struct {
+	name string
+	ino  Ino
+	typ  uint8
+}
+
+// cachedDir is a complete listing of a directory, valid only while term matches the entry term of the directory.
+type cachedDir struct {
+	term    uint64
+	entries []cachedDirEntry
+}
+
 // redisCache support bcast mode client-side cache
-// cache attrs and entries only, chunks are already cached in OpenCache
+// cache attrs, entries and directory listings only, chunks are already cached in OpenCache
 type redisCache struct {
 	cli          *redis.Client
 	tracker      *redis.Client // dedicated client for the tracking connection
@@ -59,11 +71,13 @@ type redisCache struct {
 	inodeCache *expirable.LRU[Ino, []byte]
 	entryCache *expirable.LRU[string, *cachedEntry]
 	entryTerms *expirable.LRU[Ino, uint64]
+	dirCache   *expirable.LRU[Ino, *cachedDir]
+	dirEntries atomic.Int64 // total entries held by dirCache, bounded by cap
 }
 
 func newRedisCache(prefix string, cap int, expiry time.Duration, preload int) *redisCache {
 	logger.Infof("Initializing Redis client-side cache with size %d and expiry %+v", cap, expiry)
-	return &redisCache{
+	c := &redisCache{
 		prefix:     prefix,
 		cap:        cap,
 		expiry:     expiry,
@@ -72,6 +86,68 @@ func newRedisCache(prefix string, cap int, expiry time.Duration, preload int) *r
 		entryCache: expirable.NewLRU[string, *cachedEntry](cap, nil, expiry),
 		entryTerms: expirable.NewLRU[Ino, uint64](0, nil, 10*expiry), // no size limit, cleanup only based on expiry
 	}
+	c.dirCache = expirable.NewLRU[Ino, *cachedDir](0, func(_ Ino, d *cachedDir) {
+		c.dirEntries.Add(-int64(len(d.entries)))
+	}, expiry)
+	return c
+}
+
+// fits reports whether a directory with n entries can be cached without evicting everything else.
+func (c *redisCache) fits(n int) bool {
+	return c != nil && n <= c.cap
+}
+
+// getDir returns the cached listing of parent if no change to it has been seen since it was cached.
+func (c *redisCache) getDir(parent Ino) ([]cachedDirEntry, bool) {
+	d, ok := c.dirCache.Get(parent)
+	if !ok || d.term != c.entryTerm(parent) {
+		return nil, false
+	}
+	return d.entries, true
+}
+
+// addDir caches a complete listing of parent read under term. It is dropped if parent changed meanwhile.
+func (c *redisCache) addDir(parent Ino, term uint64, entries []*Entry) {
+	if !c.fits(len(entries)) || c.entryTerm(parent) != term {
+		return
+	}
+	d := &cachedDir{term: term, entries: make([]cachedDirEntry, len(entries))}
+	for i, e := range entries {
+		d.entries[i] = cachedDirEntry{name: string(e.Name), ino: e.Inode, typ: e.Attr.Typ}
+	}
+	c.dirCache.Remove(parent) // Add does not call onEvict when replacing
+	c.dirCache.Add(parent, d)
+	c.dirEntries.Add(int64(len(d.entries)))
+	for c.dirEntries.Load() > int64(c.cap) {
+		if _, _, ok := c.dirCache.RemoveOldest(); !ok {
+			break
+		}
+	}
+}
+
+func (c *redisCache) invalidateDir(parent Ino) {
+	c.bumpEntryTerm(parent)
+	c.dirCache.Remove(parent)
+}
+
+// getAttr returns the cached attr of inode. On a miss it leaves a mark so that the result
+// of the following fetch can be cached by addAttr, unless an invalidation arrives in between.
+func (c *redisCache) getAttr(inode Ino, mark bool) ([]byte, bool) {
+	if data, ok := c.inodeCache.Get(inode); ok && len(data) > 0 {
+		return data, true
+	}
+	if mark {
+		c.inodeCache.AddIf(inode, inodeMark, func(oldVal []byte, exists bool) bool {
+			return !exists
+		})
+	}
+	return nil, false
+}
+
+func (c *redisCache) addAttr(inode Ino, data []byte) {
+	_, _ = c.inodeCache.AddIf(inode, data, func(oldVal []byte, exists bool) bool {
+		return exists && len(oldVal) == 0
+	})
 }
 
 func (c *redisCache) init(cli redis.UniversalClient) error {
@@ -172,7 +248,7 @@ func (c *redisCache) HandlePushNotification(ctx context.Context, handlerCtx push
 			parentStr := key[len(c.prefix)+1:]
 			parent, err := strconv.ParseUint(parentStr, 10, 64)
 			if err == nil {
-				c.bumpEntryTerm(Ino(parent))
+				c.invalidateDir(Ino(parent))
 			}
 		}
 	}
@@ -241,27 +317,50 @@ func (c *redisCache) afterProcess(cmd redis.Cmder) {
 				})
 			}
 		}
-	case "set":
-		if typ == keyTypInode {
-			if cmd.(*redis.StatusCmd).Err() == nil {
-				if num, err := strconv.ParseUint(key[len(c.prefix)+1:], 10, 64); err == nil {
-					_ = c.inodeCache.Remove(Ino(num))
-				}
-			}
+	default:
+		c.invalidate(cmd)
+	}
+}
+
+// invalidate drops cached data touched by a write of this client, without waiting for
+// the invalidation message from Redis. Dropping is always safe, so it is done even if the write failed.
+func (c *redisCache) invalidate(cmd redis.Cmder) {
+	args := cmd.Args()
+	if len(args) < 2 {
+		return
+	}
+	var keys []interface{}
+	switch cmd.Name() {
+	case "set", "setnx", "hset", "hsetnx", "hdel":
+		keys = args[1:2]
+	case "del", "unlink":
+		keys = args[1:]
+	default:
+		return
+	}
+	for _, k := range keys {
+		key, ok := k.(string)
+		if !ok {
+			continue
 		}
-	case "hdel":
-		if typ == keyTypEntry {
-			if err := cmd.(*redis.IntCmd).Err(); err == nil {
+		switch c.parse(key) {
+		case keyTypInode:
+			if num, err := strconv.ParseUint(key[len(c.prefix)+1:], 10, 64); err == nil {
+				_ = c.inodeCache.Remove(Ino(num))
+			}
+		case keyTypEntry:
+			parentStr := key[len(c.prefix)+1:]
+			if num, err := strconv.ParseUint(parentStr, 10, 64); err == nil {
+				c.invalidateDir(Ino(num))
+			}
+			switch cmd.Name() {
+			case "hdel":
 				for i := 2; i < len(args); i++ {
-					_ = c.entryCache.Remove(fmt.Sprintf("%s%d%s", key[len(c.prefix)+1:], os.PathSeparator, args[i]))
+					_ = c.entryCache.Remove(fmt.Sprintf("%s%d%s", parentStr, os.PathSeparator, args[i]))
 				}
-			}
-		}
-	case "hset":
-		if typ == keyTypEntry {
-			if err := cmd.(*redis.IntCmd).Err(); err == nil {
+			case "hset", "hsetnx":
 				for i := 2; i < len(args); i += 2 {
-					_ = c.entryCache.Remove(fmt.Sprintf("%s%d%s", key[len(c.prefix)+1:], os.PathSeparator, args[i]))
+					_ = c.entryCache.Remove(fmt.Sprintf("%s%d%s", parentStr, os.PathSeparator, args[i]))
 				}
 			}
 		}
@@ -279,9 +378,7 @@ func (c *redisCache) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 		}
 		if inTx.Load() {
 			err := next(ctx, cmd)
-			if cmd.Name() != "get" {
-				c.afterProcess(cmd)
-			}
+			c.invalidate(cmd)
 			return err
 		}
 		if !c.beforeProcess(cmd, false) {
@@ -293,20 +390,15 @@ func (c *redisCache) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 	}
 }
 
+// ProcessPipelineHook only invalidates: reads in pipelines (including MULTI/EXEC) are not served from or added to the cache.
 func (c *redisCache) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
-	return nil
-	/*
-		return func(ctx context.Context, cmds []redis.Cmder) error {
-			for _, cmd := range cmds {
-				_ = c.beforeProcess(cmd, true)
-			}
-			err := next(ctx, cmds)
-			for _, cmd := range cmds {
-				c.afterProcess(cmd)
-			}
-			return err
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		err := next(ctx, cmds)
+		for _, cmd := range cmds {
+			c.invalidate(cmd)
 		}
-	*/
+		return err
+	}
 }
 
 func (c *redisCache) close() {
@@ -329,6 +421,7 @@ func (c *redisCache) onInvalidateConnect(ctx context.Context, cn *redis.Conn) er
 	// clear all caches on reconnect
 	c.inodeCache.Purge()
 	c.entryCache.Purge()
+	c.dirCache.Purge()
 	c.entryTerms.Purge()
 	// use the pubsub connection to handle tracking and invalidate
 	_ = cn.Do(ctx, "CLIENT", "TRACKING", "OFF").Err()
