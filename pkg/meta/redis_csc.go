@@ -25,6 +25,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -60,13 +61,30 @@ type cachedDir struct {
 // redisCache support bcast mode client-side cache
 // cache attrs, entries and directory listings only, chunks are already cached in OpenCache
 type redisCache struct {
-	cli          *redis.Client
-	tracker      *redis.Client // dedicated client for the tracking connection
-	prefix       string
-	cap          int
-	expiry       time.Duration
-	preload      int
+	cli     *redis.Client // client whose commands are served from the cache
+	tracker *redis.Client // dedicated client for the tracking connection
+	prefix  string
+	cap     int
+	expiry  time.Duration
+	preload int
+
+	mu           sync.Mutex
 	subscription *redis.PubSub
+	done         chan struct{}
+	wg           sync.WaitGroup
+
+	// Liveness of the tracking connection: cached data is used only if a PING sent less than
+	// stale() ago was answered, so that all invalidations sent before it have been applied.
+	// The bound adapts to the round-trip times measured by PINGs, within [minStale, maxStale].
+	pingInterval time.Duration
+	minStale     time.Duration
+	maxStale     time.Duration
+	minDeadAfter time.Duration
+	start        time.Time
+	confirmed    atomic.Int64 // send time (since start) of the latest answered PING
+	staleBound   atomic.Int64
+	rtts         [30]time.Duration // recent round-trip times, only used by the tracking goroutine
+	rttIdx       int
 
 	inodeCache *expirable.LRU[Ino, []byte]
 	entryCache *expirable.LRU[string, *cachedEntry]
@@ -78,18 +96,62 @@ type redisCache struct {
 func newRedisCache(prefix string, cap int, expiry time.Duration, preload int) *redisCache {
 	logger.Infof("Initializing Redis client-side cache with size %d and expiry %+v", cap, expiry)
 	c := &redisCache{
-		prefix:     prefix,
-		cap:        cap,
-		expiry:     expiry,
-		preload:    preload,
-		inodeCache: expirable.NewLRU[Ino, []byte](cap, nil, expiry),
-		entryCache: expirable.NewLRU[string, *cachedEntry](cap, nil, expiry),
-		entryTerms: expirable.NewLRU[Ino, uint64](0, nil, 10*expiry), // no size limit, cleanup only based on expiry
+		prefix:       prefix,
+		cap:          cap,
+		expiry:       expiry,
+		preload:      preload,
+		done:         make(chan struct{}),
+		pingInterval: time.Second,
+		minStale:     3 * time.Second,
+		maxStale:     30 * time.Second,
+		minDeadAfter: 10 * time.Second,
+		start:        time.Now(),
+		inodeCache:   expirable.NewLRU[Ino, []byte](cap, nil, expiry),
+		entryCache:   expirable.NewLRU[string, *cachedEntry](cap, nil, expiry),
+		entryTerms:   expirable.NewLRU[Ino, uint64](0, nil, 10*expiry), // no size limit, cleanup only based on expiry
 	}
 	c.dirCache = expirable.NewLRU[Ino, *cachedDir](0, func(_ Ino, d *cachedDir) {
 		c.dirEntries.Add(-int64(len(d.entries)))
 	}, expiry)
+	c.staleBound.Store(int64(c.minStale))
+	c.confirmed.Store(-int64(c.maxStale)) // not live until the first PING is answered
 	return c
+}
+
+// live reports whether cached data can be used: all invalidations sent by Redis before a recent PING
+// have been applied, so cached data is less than stale() behind. Writes of this client are applied immediately.
+func (c *redisCache) live() bool {
+	return time.Since(c.start)-time.Duration(c.confirmed.Load()) < c.stale()
+}
+
+func (c *redisCache) stale() time.Duration {
+	return time.Duration(c.staleBound.Load())
+}
+
+// deadAfter is how long the tracking connection may receive nothing before it is reconnected.
+func (c *redisCache) deadAfter() time.Duration {
+	return max(c.minDeadAfter, 3*c.stale())
+}
+
+// observeRTT adapts the staleness bound to the latency of the tracking connection, so that PONGs
+// delayed by a slow link do not make the cache unusable between them.
+func (c *redisCache) observeRTT(rtt time.Duration) {
+	c.rtts[c.rttIdx%len(c.rtts)] = rtt
+	c.rttIdx++
+	var maxRTT time.Duration
+	for _, r := range c.rtts {
+		maxRTT = max(maxRTT, r)
+	}
+	c.staleBound.Store(int64(min(max(c.minStale, c.pingInterval+2*maxRTT), c.maxStale)))
+}
+
+func (c *redisCache) confirm(sent int64) {
+	for {
+		old := c.confirmed.Load()
+		if sent <= old || c.confirmed.CompareAndSwap(old, sent) {
+			return
+		}
+	}
 }
 
 // fits reports whether a directory with n entries can be cached without evicting everything else.
@@ -99,6 +161,9 @@ func (c *redisCache) fits(n int) bool {
 
 // getDir returns the cached listing of parent if no change to it has been seen since it was cached.
 func (c *redisCache) getDir(parent Ino) ([]cachedDirEntry, bool) {
+	if !c.live() {
+		return nil, false
+	}
 	d, ok := c.dirCache.Get(parent)
 	if !ok || d.term != c.entryTerm(parent) {
 		return nil, false
@@ -133,7 +198,7 @@ func (c *redisCache) invalidateDir(parent Ino) {
 // getAttr returns the cached attr of inode. On a miss it leaves a mark so that the result
 // of the following fetch can be cached by addAttr, unless an invalidation arrives in between.
 func (c *redisCache) getAttr(inode Ino, mark bool) ([]byte, bool) {
-	if data, ok := c.inodeCache.Get(inode); ok && len(data) > 0 {
+	if data, ok := c.inodeCache.Get(inode); ok && len(data) > 0 && c.live() {
 		return data, true
 	}
 	if mark {
@@ -168,20 +233,100 @@ func (c *redisCache) init(cli redis.UniversalClient) error {
 	c.tracker = redis.NewClient(&opt)
 	// handle PUSH notifications for invalidation in c.HandlePushNotification
 	if err = c.tracker.RegisterPushNotificationHandler("invalidate", c, true); err != nil {
-		c.close()
+		_ = c.tracker.Close()
 		return err
 	}
-	// under the RESP3 protocol, "__redis__:invalidate" actually has no effect.
-	// we use Pubsub channel to simplify connection management and receiving PUSH messages.
-	c.subscription = c.tracker.Subscribe(ctx)
-	if err = c.subscription.Subscribe(ctx, "__redis__:invalidate"); err != nil {
-		c.close()
+	sub, err := c.subscribe(ctx)
+	if err != nil {
+		_ = c.tracker.Close()
 		return err
 	}
-	_ = c.subscription.Channel()
+	c.subscription = sub
 	// handle client cmd to avoid race conditions
 	c.cli.AddHook(c)
+	c.wg.Add(1)
+	go c.track(sub)
 	return nil
+}
+
+// under the RESP3 protocol, "__redis__:invalidate" actually has no effect.
+// we use Pubsub channel to simplify connection management and receiving PUSH messages.
+func (c *redisCache) subscribe(ctx context.Context) (*redis.PubSub, error) {
+	sub := c.tracker.Subscribe(ctx)
+	if err := sub.Subscribe(ctx, "__redis__:invalidate"); err != nil {
+		_ = sub.Close()
+		return nil, err
+	}
+	return sub, nil
+}
+
+// track keeps the tracking connection alive, and confirms that invalidations are up to date by sending
+// PINGs on it: a PONG is received only after all invalidations sent before it have been handled.
+func (c *redisCache) track(sub *redis.PubSub) {
+	defer c.wg.Done()
+	ctx := context.Background()
+	for {
+		err := c.watch(ctx, sub)
+		select {
+		case <-c.done:
+			return
+		default:
+		}
+		logger.Warnf("Redis client-side cache: reconnect tracking connection: %v", err)
+		_ = sub.Close()
+		for {
+			if sub, err = c.subscribe(ctx); err == nil {
+				break
+			}
+			logger.Warnf("Redis client-side cache: subscribe: %v", err)
+			select {
+			case <-c.done:
+				return
+			case <-time.After(c.pingInterval):
+			}
+		}
+		c.mu.Lock()
+		closed := c.subscription == nil
+		if !closed {
+			c.subscription = sub
+		}
+		c.mu.Unlock()
+		if closed {
+			_ = sub.Close()
+			return
+		}
+	}
+}
+
+// watch handles messages on the tracking connection until it is closed or considered dead.
+func (c *redisCache) watch(ctx context.Context, sub *redis.PubSub) error {
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		ticker := time.NewTicker(c.pingInterval)
+		defer ticker.Stop()
+		for {
+			_ = sub.Ping(ctx, strconv.FormatInt(int64(time.Since(c.start)), 10))
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	for {
+		// invalidations are handled by HandlePushNotification before the next message is returned
+		msg, err := sub.ReceiveTimeout(ctx, c.deadAfter())
+		if err != nil {
+			return err
+		}
+		if pong, ok := msg.(*redis.Pong); ok {
+			if sent, err := strconv.ParseInt(pong.Payload, 10, 64); err == nil {
+				c.observeRTT(time.Since(c.start) - time.Duration(sent))
+				c.confirm(sent)
+			}
+		}
+	}
 }
 
 const (
@@ -276,7 +421,7 @@ func (c *redisCache) beforeProcess(cmd redis.Cmder, skip bool) bool {
 		if err == nil {
 			inode := Ino(num)
 			if data, ok := c.inodeCache.Get(inode); ok {
-				if !skip && len(data) > 0 {
+				if !skip && len(data) > 0 && c.live() {
 					rsp := cmd.(*redis.StringCmd)
 					rsp.SetErr(nil)
 					rsp.SetVal(bytesToString(data))
@@ -402,19 +547,19 @@ func (c *redisCache) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.P
 }
 
 func (c *redisCache) close() {
-	if c.subscription != nil {
-		if err := c.subscription.Close(); err != nil {
-			logger.Warnf("failed closing Redis cache subscription: %v", err)
-		}
-		c.subscription = nil
+	c.mu.Lock()
+	sub := c.subscription
+	c.subscription = nil
+	c.mu.Unlock()
+	if sub == nil {
+		return
 	}
-	if c.tracker != nil {
-		if err := c.tracker.Close(); err != nil {
-			logger.Warnf("failed closing Redis cache tracking client: %v", err)
-		}
-		c.tracker = nil
+	close(c.done)
+	_ = sub.Close() // may be closed already if track is reconnecting
+	c.wg.Wait()
+	if err := c.tracker.Close(); err != nil {
+		logger.Warnf("failed closing Redis cache tracking client: %v", err)
 	}
-	c.cli = nil
 }
 
 func (c *redisCache) onInvalidateConnect(ctx context.Context, cn *redis.Conn) error {

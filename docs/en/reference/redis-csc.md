@@ -62,6 +62,16 @@ JuiceFS uses BCAST mode for simplicity and reliability:
 
 BCAST mode provides the simplest implementation while ensuring cache coherence across all clients.
 
+## Consistency
+
+Cached data is kept up to date by invalidation messages, not by expiration:
+
+- Changes made by the client itself are applied to its cache immediately.
+- Changes made by other clients are applied when their invalidation messages arrive.
+- The client sends a `PING` on the tracking connection every second. Since its reply arrives only after all earlier invalidation messages, cached data is used only while a recently sent `PING` has been answered; otherwise requests go to Redis. "Recently" adapts to the latency measured by these `PING`s: 1 second plus twice the largest recent round-trip time, at least 3 and at most 30 seconds. A tracking connection that receives nothing for 3 times that long (at least 10 seconds) is reconnected, and the cache is cleared on every reconnect.
+
+So cached data is never more than a few seconds behind (up to 30 seconds on very slow links), even if the connection to Redis is lost, and `client-cache-expire` only bounds memory usage of rarely used entries. It can be set much longer (e.g. `10m`) when Redis is far away.
+
 ## Requirements
 
 - Redis server version 6.0 or higher

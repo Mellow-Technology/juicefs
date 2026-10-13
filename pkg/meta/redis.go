@@ -975,7 +975,7 @@ func (m *redisMeta) doLookup(ctx Context, parent Ino, name string, inode *Ino, a
 	if m.cache != nil {
 		cacheKey = m.cache.entryName(parent, name)
 		entryTerm = m.cache.entryTerm(parent)
-		if entry, ok := m.cache.entryCache.Get(cacheKey); ok {
+		if entry, ok := m.cache.entryCache.Get(cacheKey); ok && m.cache.live() {
 			if entry.term >= entryTerm && !entry.isMark() {
 				if attr == nil {
 					*inode = entry.ino

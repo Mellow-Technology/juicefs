@@ -21,6 +21,13 @@ func mockRedisCSCMeta(t *testing.T) *redisMeta {
 	return m.(*redisMeta)
 }
 
+// newLiveCache returns a cache without tracking connection, considered live for stale().
+func newLiveCache(prefix string, cap int, expiry time.Duration) *redisCache {
+	c := newRedisCache(prefix, cap, expiry, 0)
+	c.confirm(int64(time.Since(c.start)))
+	return c
+}
+
 func TestRedisCache(t *testing.T) {
 	ctx := context.Background()
 	m := mockRedisCSCMeta(t)
@@ -161,6 +168,7 @@ func TestRedisCache(t *testing.T) {
 		fresh, stale := m.marshal(&Attr{Typ: TypeFile, Length: 2}), m.marshal(&Attr{Typ: TypeFile, Length: 1})
 		require.NoError(t, m.rdb.Set(ctx, m.inodeKey(ino), fresh, 0).Err())
 		time.Sleep(100 * time.Millisecond) // let the invalidation pass
+		require.Eventually(t, m.cache.live, 3*time.Second, 10*time.Millisecond)
 		// an invalidation that has not arrived yet
 		m.cache.inodeCache.Add(ino, stale)
 		v, err := m.rdb.Get(ctx, m.inodeKey(ino)).Bytes()
@@ -334,6 +342,7 @@ func TestRedisCache(t *testing.T) {
 		}
 		require.Eventually(t, func() bool { return m.cache.entryTerm(parent) > 0 }, 3*time.Second, 10*time.Millisecond)
 	}
+	require.Eventually(t, m.cache.live, 3*time.Second, 10*time.Millisecond)
 
 	t.Run("dir listing is cached and invalidated by other clients", func(t *testing.T) {
 		parent := Ino(200)
@@ -389,7 +398,7 @@ func TestRedisCache(t *testing.T) {
 	})
 
 	t.Run("pipeline hook invalidates writes without waiting for redis", func(t *testing.T) {
-		cache := newRedisCache("", 100, time.Second, 0)
+		cache := newLiveCache("", 100, time.Second)
 		hook := cache.ProcessPipelineHook(func(ctx context.Context, cmds []redis.Cmder) error { return nil })
 		ls := []*Entry{{Inode: 271, Name: []byte("a"), Attr: &Attr{Typ: TypeFile}}}
 		cache.addDir(270, 0, ls)
@@ -447,7 +456,7 @@ func TestRedisCache(t *testing.T) {
 	})
 
 	t.Run("dir listing read before a change is not cached", func(t *testing.T) {
-		cache := newRedisCache("jfs", 100, time.Second, 0)
+		cache := newLiveCache("jfs", 100, time.Second)
 		parent := Ino(240)
 		term := cache.entryTerm(parent)
 		cache.invalidateDir(parent)
@@ -457,7 +466,7 @@ func TestRedisCache(t *testing.T) {
 	})
 
 	t.Run("dir cache is bounded by total entries", func(t *testing.T) {
-		cache := newRedisCache("jfs", 10, time.Second, 0)
+		cache := newLiveCache("jfs", 10, time.Second)
 		list := func(n int) []*Entry {
 			es := make([]*Entry, n)
 			for i := range es {
@@ -495,5 +504,61 @@ func TestRedisCache(t *testing.T) {
 		require.NoError(t, m.cache.onInvalidateConnect(ctx, conn))
 		_, ok = m.cache.getDir(parent)
 		require.False(t, ok)
+	})
+
+	t.Run("cached data is not used without a recent PONG", func(t *testing.T) {
+		cache := newLiveCache("jfs", 100, time.Minute)
+		cache.addDir(290, 0, []*Entry{{Inode: 291, Name: []byte("a"), Attr: &Attr{Typ: TypeFile}}})
+		cache.inodeCache.Add(291, []byte("attr"))
+		_, ok := cache.getDir(290)
+		require.True(t, ok)
+		_, ok = cache.getAttr(291, false)
+		require.True(t, ok)
+
+		cache.confirmed.Store(int64(time.Since(cache.start) - cache.stale()))
+		require.False(t, cache.live())
+		_, ok = cache.getDir(290)
+		require.False(t, ok)
+		_, ok = cache.getAttr(291, false)
+		require.False(t, ok)
+
+		// once a PONG arrives, all earlier invalidations have been applied and the cache is usable again
+		cache.confirm(int64(time.Since(cache.start)))
+		_, ok = cache.getDir(290)
+		require.True(t, ok)
+		cache.confirm(0) // an older PONG does not move liveness backwards
+		require.True(t, cache.live())
+	})
+
+	t.Run("liveness follows PONGs on the tracking connection", func(t *testing.T) {
+		require.Eventually(t, m.cache.live, 3*time.Second, 10*time.Millisecond)
+		// stall the tracking connection: no PONG until Redis resumes
+		require.NoError(t, other.Do(ctx, "CLIENT", "PAUSE", (m.cache.stale()+1500*time.Millisecond).Milliseconds(), "ALL").Err())
+		require.Eventually(t, func() bool { return !m.cache.live() }, m.cache.stale()+time.Second, 10*time.Millisecond)
+		require.Eventually(t, m.cache.live, 5*time.Second, 10*time.Millisecond)
+		// PONGs delayed by the pause are measured as a slow round trip
+		require.Greater(t, m.cache.stale(), m.cache.minStale)
+	})
+
+	t.Run("staleness bound adapts to measured latency", func(t *testing.T) {
+		cache := newRedisCache("jfs", 100, time.Minute, 0)
+		require.Equal(t, 3*time.Second, cache.stale())
+		require.Equal(t, 10*time.Second, cache.deadAfter())
+
+		cache.observeRTT(50 * time.Millisecond) // a fast link keeps the minimum
+		require.Equal(t, 3*time.Second, cache.stale())
+
+		cache.observeRTT(2 * time.Second) // ping interval + 2 * RTT
+		require.Equal(t, 5*time.Second, cache.stale())
+		require.Equal(t, 15*time.Second, cache.deadAfter())
+
+		cache.observeRTT(time.Minute) // capped
+		require.Equal(t, 30*time.Second, cache.stale())
+
+		// recovers once slow samples leave the window
+		for range len(cache.rtts) {
+			cache.observeRTT(100 * time.Millisecond)
+		}
+		require.Equal(t, 3*time.Second, cache.stale())
 	})
 }
